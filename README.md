@@ -2,6 +2,21 @@
 
  Development of a transfer learning system for the detection of cyber-attacks in 5G and IoT networks. Transfer learning will improve the accuracy and precision of cyber-attacks detection in 5G /IoT networks with limited computing capability and datasets with scarce labeled data.
 
+# BoT-IoT → ToN-IoT transfer learning pipeline
+
+[`bot_ton_tl/`](bot_ton_tl/README.md) contains a complete pipeline for transferring from
+BoT-IoT (source) to ToN-IoT (target) with scarce target labels. It harmonises and
+de-duplicates the raw CSVs, measures the domain shift, and compares source-only,
+target-only, random-forest, frozen-encoder, fine-tuning (LP-FT) and DANN models over
+label budgets. Start with [`bot_ton_tl/README.md`](bot_ton_tl/README.md):
+
+```bat
+python -m pip install -r requirements-tl.txt
+python -m bot_ton_tl.prepare --root "path\to\csv folder" --out prepared
+python -m bot_ton_tl.diagnose --prepared prepared
+python -m bot_ton_tl.experiment --prepared prepared --out results\main --include-full
+```
+
  # How to run the code?
 
 If you want to run the code to see the result of Transfer Leraning you must use the file ([code](https://github.com/polvalls9/Transfer-Learning-Based-Intrusion-Detection-in-5G-and-IoT-Networks/blob/main/codes/TL%20-%20CNN-TL.ipynb)). Download the zip file of the project and run the file marked in the link above.

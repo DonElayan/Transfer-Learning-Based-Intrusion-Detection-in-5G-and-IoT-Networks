@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# bot_ton_tl outputs
+/prepared/
+/results/
+/synthetic_raw/

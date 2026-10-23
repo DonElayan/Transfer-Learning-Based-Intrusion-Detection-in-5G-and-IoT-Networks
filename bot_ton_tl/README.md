@@ -69,6 +69,11 @@ makes. Each one is a flag, so you can run any of them as an ablation.
 
 ## 3. Running it (Windows, PyCharm terminal)
 
+**Easiest: one file.** [`bot_ton_tl_all_in_one.py`](../bot_ton_tl_all_in_one.py) (repo root)
+contains the whole pipeline. Edit the SETTINGS block at its top (`DATA_ROOT`,
+`QUICK_TRIAL`, ...) and press Run in PyCharm. `--self-test` checks the installation on
+synthetic data. The commands below are the same pipeline as separate modules.
+
 ```bat
 cd path\to\Transfer-Learning-Based-Intrusion-Detection-in-5G-and-IoT-Networks
 python -m pip install -r requirements-tl.txt

@@ -8,7 +8,8 @@
 BoT-IoT (source) to ToN-IoT (target) with scarce target labels. It harmonises and
 de-duplicates the raw CSVs, measures the domain shift, and compares source-only,
 target-only, random-forest, frozen-encoder, fine-tuning (LP-FT) and DANN models over
-label budgets. Start with [`bot_ton_tl/README.md`](bot_ton_tl/README.md):
+label budgets. Start with [`bot_ton_tl/README.md`](bot_ton_tl/README.md), or run the
+single-file version [`bot_ton_tl_all_in_one.py`](bot_ton_tl_all_in_one.py) (edit its SETTINGS block, then Run):
 
 ```bat
 python -m pip install -r requirements-tl.txt

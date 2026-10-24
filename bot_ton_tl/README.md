@@ -37,6 +37,8 @@ raw CSVs ──prepare──► bot.parquet / ton.parquet ──diagnose──�
 | `frozen` | k/class | BoT-IoT encoder frozen + new dense head (the recipe of this repo's `TL - CNN-TL.ipynb`) |
 | `finetune` | k/class | BoT-IoT encoder, **LP-FT**: train new head, then unfreeze all with 10× smaller encoder LR |
 | `dann` | k/class | encoder pre-trained with DANN (BoT labels + unlabelled ToN flows), then LP-FT |
+| `finetune_full` | k/class | BoT-IoT encoder, then trained **exactly like `target_only`** (same LR, steps, early stopping). The only difference is the initialisation, so `finetune_full − target_only` is the clean transfer effect |
+| `dann_full` | k/class | same, from the DANN encoder |
 
 The encoder is a ~30k-parameter MLP (`--arch mlp`, default) or a 1-D CNN mirroring the
 repository's CNN-B (`--arch cnn1d`). Both are small enough for constrained IoT/edge devices.
@@ -135,6 +137,14 @@ balanced accuracy 0.948; most of the remaining error is DoS↔DDoS (see decision
 6. **Normalisation:** `--norm per_domain` and `--norm source`.
 7. **Scenario split:** `--test-files ...` after checking per-file class support in the
    Phase 2.4 report. Report it separately from the hash split.
+
+`summary.txt` ends with a **transfer-gain table**. It gives each transfer method minus
+`target_only` and minus `rf`, paired by seed, as the mean difference and the number of seeds
+where transfer wins. Claim a gain only where it wins on every seed.
+
+Feature group `timing` (duration, packet rate, byte rate) is separate. It depends on how
+Argus and Zeek cut flows, and it was the most shifted group in the diagnostics. Compare it
+with `--features volume shape proto ports`.
 
 Report mean ± std over ≥ 3 seeds (5 for the paper). State the test-set class counts
 (printed in `summary.txt`). Do not tune anything on the ToN test set.

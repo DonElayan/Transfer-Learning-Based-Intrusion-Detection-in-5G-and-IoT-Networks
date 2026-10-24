@@ -1,8 +1,11 @@
 """Canonical rows -> model features, computed identically for both datasets.
 
 Feature groups (choose with --features):
-  volume  log1p of bytes / packets / duration per direction and in total
-  shape   bytes per packet, direction ratios, packet and byte rates, reply flag
+  volume  log1p of bytes / packets per direction and in total
+  shape   bytes per packet, direction ratios, reply flag
+  timing  log1p of duration, packet rate and byte rate. These depend on how each tool
+          cuts flows (Argus status intervals vs Zeek connection timeouts) and were the
+          three most shifted features between BoT-IoT and ToN-IoT, so ablate them.
   proto   one-hot tcp / udp / icmp / other
   ports   coarse port ranges + a few well-known service flags (tcp/udp only).
           Ports can act as dataset shortcuts, so compare with and without them.
@@ -18,8 +21,8 @@ import pandas as pd
 
 from .schema import STATE_COARSE, STATE_LEVELS
 
-DEFAULT_GROUPS = ("volume", "shape", "proto", "ports")
-ALL_GROUPS = ("volume", "shape", "proto", "ports", "state")
+DEFAULT_GROUPS = ("volume", "shape", "timing", "proto", "ports")
+ALL_GROUPS = ("volume", "shape", "timing", "proto", "ports", "state")
 PROTOS = ("tcp", "udp", "icmp", "other")
 SERVICE_PORTS = {
     "http": (80, 8080, 8000, 8008, 8888),
@@ -60,7 +63,6 @@ def build_features(df: pd.DataFrame, domain: str, groups=DEFAULT_GROUPS) -> tupl
             "log_src_bytes": np.log1p(sb), "log_dst_bytes": np.log1p(db),
             "log_src_pkts": np.log1p(sp), "log_dst_pkts": np.log1p(dp),
             "log_tot_bytes": np.log1p(tb), "log_tot_pkts": np.log1p(tp),
-            "log_duration": np.log1p(dur),
         })
     if "shape" in groups:
         cols.update({
@@ -68,9 +70,13 @@ def build_features(df: pd.DataFrame, domain: str, groups=DEFAULT_GROUPS) -> tupl
             "log_dst_bytes_per_pkt": np.log1p(db / np.maximum(dp, 1)),
             "src_byte_share": sb / np.maximum(tb, 1),
             "src_pkt_share": sp / np.maximum(tp, 1),
+            "has_reply": (dp > 0).astype(np.float64),
+        })
+    if "timing" in groups:
+        cols.update({
+            "log_duration": np.log1p(dur),
             "log_pkt_rate": np.log1p(tp / (dur + RATE_EPS)),
             "log_byte_rate": np.log1p(tb / (dur + RATE_EPS)),
-            "has_reply": (dp > 0).astype(np.float64),
         })
     proto = df["proto"].astype(str).to_numpy()
     if "proto" in groups:

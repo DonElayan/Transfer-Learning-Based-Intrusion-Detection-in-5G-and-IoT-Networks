@@ -28,6 +28,7 @@ OUTPUTS (inside <DATA_ROOT>\TL_BoT_ToN_pipeline\)
   results\main\summary.txt               main result tables (mean +- std over seeds)
   results\main\learning_curve_*.png      figures
   results\main\results.csv, per_class.csv
+  results\main_no_timing\...             one folder per ablation
   pipeline_log.txt                        everything printed to the console
 
 This file bundles the modules of the bot_ton_tl/ package (same code, see bot_ton_tl/README.md
@@ -36,7 +37,7 @@ for the method and the reasoning behind every data decision).
 COMMAND LINE (optional, overrides the settings)
   python bot_ton_tl_all_in_one.py --self-test     synthetic data, no real files needed
   python bot_ton_tl_all_in_one.py --quick         quick trial on the real files
-  python bot_ton_tl_all_in_one.py --stages experiment --ablations
+  python bot_ton_tl_all_in_one.py --stages experiment --ablations no_timing no_ports
 """
 from __future__ import annotations
 
@@ -46,24 +47,30 @@ OUTPUT_DIR = None              # None -> <DATA_ROOT>\TL_BoT_ToN_pipeline
 STAGES = ["prepare", "diagnose", "experiment"]
 REUSE_PREPARED = True          # skip 'prepare' if it already finished with the same settings
 QUICK_TRIAL = False            # True: first 100k rows per file, 1 seed, 2 budgets, short training
-RUN_ABLATIONS = False          # True: after the main run, also run the three ablations below
+ABLATIONS = ["no_timing"]      # extra runs after the main one; any of:
+                               #   "no_timing"      drop duration / packet-rate / byte-rate features
+                               #   "no_ports"       drop port features
+                               #   "unseen_classes" never label UNSEEN_CLASSES (zero-day detection)
+                               #   "merged_classes" merge dos+ddos
 
 SEEDS = [0, 1, 2]
 SHOTS = [10, 50, 100, 500, 1000]       # labelled ToN-IoT flows per class
 INCLUDE_FULL = True                    # also train on the whole (capped) ToN pool = upper bound
 TASKS = ["binary", "multiclass"]
-METHODS = ["source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann"]
+# Run 2 set. Run 1 answered frozen / dann (both below target_only); finetune is kept as the
+# run-1 reference. Every method: source_only, dann_zero, target_only, rf, frozen, finetune,
+# dann, finetune_full, dann_full
+METHODS = ["source_only", "target_only", "rf", "finetune", "finetune_full", "dann_full"]
 ARCH = "mlp"                           # "mlp" or "cnn1d" (1-D version of the repo's CNN-B)
-FEATURES = ["volume", "shape", "proto", "ports"]   # add "state" for the coarse-state ablation
+FEATURES = ["volume", "shape", "timing", "proto", "ports"]   # add "state" for the coarse-state ablation
 DEVICE = "auto"                        # "auto", "cpu" or "cuda"
 
 TON_BYTES = "ip"         # ToN columns paired with BoT sbytes/dbytes: "ip" (src_ip_bytes) or "payload"
 BOT_L2_BYTES = 14        # Ethernet header bytes removed per BoT-IoT packet (0 = keep raw Argus bytes)
 CHUNK_SIZE = 250_000     # rows per read in 'prepare'; use 100_000 if memory is short
 
-# ablations (only when RUN_ABLATIONS = True)
+# used by the ablations
 UNSEEN_CLASSES = ["ransomware", "mitm", "backdoor"]  # never labelled -> zero-day detection rates
-NO_PORT_FEATURES = ["volume", "shape", "proto"]
 MERGE_CLASSES = ["dos+ddos"]                          # single flows cannot separate DoS from DDoS
 # ======================================================================================
 
@@ -359,8 +366,11 @@ def parse_binary_label(raw: pd.Series) -> np.ndarray:
 #   Canonical rows -> model features, computed identically for both datasets.
 #
 #   Feature groups (choose with --features):
-#     volume  log1p of bytes / packets / duration per direction and in total
-#     shape   bytes per packet, direction ratios, packet and byte rates, reply flag
+#     volume  log1p of bytes / packets per direction and in total
+#     shape   bytes per packet, direction ratios, reply flag
+#     timing  log1p of duration, packet rate and byte rate. These depend on how each tool
+#             cuts flows (Argus status intervals vs Zeek connection timeouts) and were the
+#             three most shifted features between BoT-IoT and ToN-IoT, so ablate them.
 #     proto   one-hot tcp / udp / icmp / other
 #     ports   coarse port ranges + a few well-known service flags (tcp/udp only).
 #             Ports can act as dataset shortcuts, so compare with and without them.
@@ -370,8 +380,8 @@ def parse_binary_label(raw: pd.Series) -> np.ndarray:
 #   Raw port numbers, IP addresses, timestamps and ids are never used.
 # ==================================================================================================
 
-DEFAULT_GROUPS = ("volume", "shape", "proto", "ports")
-ALL_GROUPS = ("volume", "shape", "proto", "ports", "state")
+DEFAULT_GROUPS = ("volume", "shape", "timing", "proto", "ports")
+ALL_GROUPS = ("volume", "shape", "timing", "proto", "ports", "state")
 PROTOS = ("tcp", "udp", "icmp", "other")
 SERVICE_PORTS = {
     "http": (80, 8080, 8000, 8008, 8888),
@@ -412,7 +422,6 @@ def build_features(df: pd.DataFrame, domain: str, groups=DEFAULT_GROUPS) -> tupl
             "log_src_bytes": np.log1p(sb), "log_dst_bytes": np.log1p(db),
             "log_src_pkts": np.log1p(sp), "log_dst_pkts": np.log1p(dp),
             "log_tot_bytes": np.log1p(tb), "log_tot_pkts": np.log1p(tp),
-            "log_duration": np.log1p(dur),
         })
     if "shape" in groups:
         cols.update({
@@ -420,9 +429,13 @@ def build_features(df: pd.DataFrame, domain: str, groups=DEFAULT_GROUPS) -> tupl
             "log_dst_bytes_per_pkt": np.log1p(db / np.maximum(dp, 1)),
             "src_byte_share": sb / np.maximum(tb, 1),
             "src_pkt_share": sp / np.maximum(tp, 1),
+            "has_reply": (dp > 0).astype(np.float64),
+        })
+    if "timing" in groups:
+        cols.update({
+            "log_duration": np.log1p(dur),
             "log_pkt_rate": np.log1p(tp / (dur + RATE_EPS)),
             "log_byte_rate": np.log1p(tb / (dur + RATE_EPS)),
-            "has_reply": (dp > 0).astype(np.float64),
         })
     proto = df["proto"].astype(str).to_numpy()
     if "proto" in groups:
@@ -826,9 +839,14 @@ def fit(model: nn.Module, X: np.ndarray, y: np.ndarray, cfg: TrainConfig, rng: n
 
 
 def train_supervised(arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, cfg: TrainConfig, seed: int,
-                     X_val=None, y_val=None, head: str = "linear") -> tuple[Net, dict]:
+                     X_val=None, y_val=None, head: str = "linear",
+                     encoder_state: dict | None = None) -> tuple[Net, dict]:
+    """encoder_state=None trains from scratch; otherwise the encoder starts from the given
+    pre-trained weights and is trained exactly like the from-scratch model."""
     torch.manual_seed(seed)
     model = Net(make_encoder(arch, X.shape[1]), n_classes, head=head)
+    if encoder_state is not None:
+        model.encoder.load_state_dict(encoder_state)
     info = fit(model, X, y, cfg, np.random.default_rng(seed), X_val, y_val)
     return model, info
 
@@ -1551,16 +1569,22 @@ def synthetic_main(argv=None) -> int:
 #       target_only   same network trained from scratch on the k-shot budget    (no transfer)
 #       rf            random forest on the k-shot budget                         (no transfer)
 #       frozen        pre-trained encoder frozen + new head (the repo's CNN-TL recipe)
-#       finetune      pre-trained encoder, LP-FT (head first, then everything)
+#       finetune      pre-trained encoder, LP-FT (head first, then everything at a 10x smaller
+#                     encoder learning rate - conservative, keeps the encoder close to BoT-IoT)
 #       dann          DANN-pre-trained encoder, LP-FT
+#       finetune_full pre-trained encoder trained exactly like target_only (same learning rate,
+#                     steps and early stopping): the ONLY difference from target_only is the
+#                     initialisation, so finetune_full - target_only is the clean transfer effect
+#       dann_full     same, starting from the DANN-pre-trained encoder
 #
 #   Model selection inside a budget uses 20% of that budget only; the large ToN validation
 #   split is never used for few-shot runs (it would leak labels beyond the budget).
 # ==================================================================================================
 
-ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann")
-NEEDS_SOURCE = {"source_only", "frozen", "finetune"}
-NEEDS_DANN = {"dann_zero", "dann"}
+ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann",
+               "finetune_full", "dann_full")
+NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full"}
+NEEDS_DANN = {"dann_zero", "dann", "dann_full"}
 
 
 def experiment_parse_args(argv=None) -> argparse.Namespace:
@@ -1782,8 +1806,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         proba = np.zeros((len(t_te.X), n_out))
                         proba[:, rf.classes_] = rf.predict_proba(t_te.X)
                         info = {}
-                    elif method == "target_only":
-                        model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh)
+                    elif method in ("target_only", "finetune_full", "dann_full"):
+                        donor = {"finetune_full": src_model, "dann_full": dann_model}.get(method)
+                        model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh,
+                                                       encoder_state=None if donor is None else donor.encoder.state_dict())
                         proba = predict_proba(model, t_te.X, args.device)
                     elif method in ("frozen", "finetune", "dann"):
                         donor = dann_model if method == "dann" else src_model
@@ -1801,7 +1827,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     pd.DataFrame(per_class).to_csv(out / "per_class.csv", index=False)
     summary = summarize(results)
     summary.to_csv(out / "summary.csv", index=False)
-    text = render_summary(summary, args, src, tgt, time.time() - t_start)
+    text = render_summary(summary, args, src, tgt, time.time() - t_start) + render_gains(results)
     (out / "summary.txt").write_text(text, encoding="utf-8")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     config.update(source_classes=src_classes, target_classes=tgt_classes, features=s_tr.names,
@@ -1847,6 +1873,34 @@ def render_summary(summary: pd.DataFrame, args, src: DomainData, tgt: DomainData
             lines.append(cells.to_string())
             lines.append("")
     lines.append(f"total time {seconds / 60:.1f} min")
+    return "\n".join(lines) + "\n"
+
+
+def render_gains(results: pd.DataFrame) -> str:
+    """Paired comparison per seed: transfer method minus each no-transfer baseline."""
+    order = lambda c: (int(c) if str(c).isdigit() else float("inf"))  # noqa: E731
+    transfer = [m for m in ("finetune_full", "dann_full", "finetune", "dann", "frozen") if m in set(results["method"])]
+    lines = ["TRANSFER GAIN, paired by seed: mean macro-F1 difference (seeds where transfer wins / seeds)",
+             "positive = transfer helps; a gain is convincing only if it wins on every seed", ""]
+    for task in ("binary", "multiclass"):
+        r = results[(results["task"] == task) & (results["shots"].astype(str) != "0")]
+        if r.empty or not transfer:
+            continue
+        r = r.assign(shots=r["shots"].astype(str))
+        piv = r.pivot_table(index=["shots", "seed"], columns="method", values="macro_f1", aggfunc="first")
+        for base in ("target_only", "rf"):
+            if base not in piv:
+                continue
+            table = {}
+            for m in transfer:
+                if m not in piv:
+                    continue
+                d = (piv[m] - piv[base]).dropna()
+                g = d.groupby(level="shots")
+                table[m] = {k: f"{v.mean():+.3f} ({int((v > 0).sum())}/{len(v)})" for k, v in g}
+            frame = pd.DataFrame(table).T
+            frame = frame[sorted(frame.columns, key=order)]
+            lines += [f"[{task}] transfer minus {base}", frame.to_string(), ""]
     return "\n".join(lines) + "\n"
 
 
@@ -1944,7 +1998,15 @@ def _experiment_argv(prepared: Path, out: Path, quick: bool, extra: list[str] = 
     return argv + list(extra)  # later options override earlier ones (argparse keeps the last)
 
 
-def run_pipeline(root: Path, out_dir: Path, stages: list[str], quick: bool, ablations: bool,
+ABLATION_ARGS = {
+    "no_timing": lambda: ["--features", *[g for g in FEATURES if g != "timing"]],
+    "no_ports": lambda: ["--features", *[g for g in FEATURES if g != "ports"]],
+    "unseen_classes": lambda: ["--unseen-classes", *UNSEEN_CLASSES],
+    "merged_classes": lambda: ["--merge", *MERGE_CLASSES],
+}
+
+
+def run_pipeline(root: Path, out_dir: Path, stages: list[str], quick: bool, ablations: list[str],
                  reuse_prepared: bool = True) -> None:
     max_rows = QUICK_ROWS_PER_FILE if quick else None
     prepared = out_dir / ("prepared_quick" if quick else "prepared")
@@ -1985,21 +2047,17 @@ def run_pipeline(root: Path, out_dir: Path, stages: list[str], quick: bool, abla
     if "experiment" in stages:
         print(f"\n[experiment] -> {results / tag}", flush=True)
         experiment_main(_experiment_argv(prepared, results / tag, quick))
-        if ablations:
-            runs = {
-                "unseen_classes": ["--unseen-classes", *UNSEEN_CLASSES],
-                "no_ports": ["--features", *NO_PORT_FEATURES],
-                "merged_classes": ["--merge", *MERGE_CLASSES],
-            }
-            for name, extra in runs.items():
-                print(f"\n[ablation: {name}] -> {results / (tag + '_' + name)}", flush=True)
-                experiment_main(_experiment_argv(prepared, results / (tag + "_" + name), quick, extra))
+        for name in ablations:
+            print(f"\n[ablation: {name}] -> {results / (tag + '_' + name)}", flush=True)
+            experiment_main(_experiment_argv(prepared, results / (tag + "_" + name), quick, ABLATION_ARGS[name]()))
 
     print("\n" + "=" * 90)
     print("DONE. Files to look at / send back for interpretation:")
     for f in (prepared / "prepare_report.txt", diag_dir / "diagnose_report.txt",
               results / tag / "summary.txt", results / tag / "learning_curve_binary.png",
-              results / tag / "learning_curve_multiclass.png", out_dir / "pipeline_log.txt"):
+              results / tag / "learning_curve_multiclass.png", results / tag / "per_class.csv",
+              *[results / (tag + "_" + a) / "summary.txt" for a in ablations],
+              out_dir / "pipeline_log.txt"):
         print(f"  {f}{'' if f.exists() else '   (not produced in this run)'}")
     print("=" * 90, flush=True)
 
@@ -2011,7 +2069,7 @@ def orchestrator_main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--stages", nargs="+", choices=["prepare", "diagnose", "experiment"], default=list(STAGES))
     ap.add_argument("--quick", action="store_true", default=QUICK_TRIAL)
-    ap.add_argument("--ablations", action="store_true", default=RUN_ABLATIONS)
+    ap.add_argument("--ablations", nargs="*", default=list(ABLATIONS), choices=list(ABLATION_ARGS))
     ap.add_argument("--self-test", action="store_true",
                     help="generate synthetic CSVs with the real headers in a temp folder and run everything on them")
     args = ap.parse_args(argv)

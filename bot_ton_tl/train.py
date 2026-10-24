@@ -99,9 +99,14 @@ def fit(model: nn.Module, X: np.ndarray, y: np.ndarray, cfg: TrainConfig, rng: n
 
 
 def train_supervised(arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, cfg: TrainConfig, seed: int,
-                     X_val=None, y_val=None, head: str = "linear") -> tuple[Net, dict]:
+                     X_val=None, y_val=None, head: str = "linear",
+                     encoder_state: dict | None = None) -> tuple[Net, dict]:
+    """encoder_state=None trains from scratch; otherwise the encoder starts from the given
+    pre-trained weights and is trained exactly like the from-scratch model."""
     torch.manual_seed(seed)
     model = Net(make_encoder(arch, X.shape[1]), n_classes, head=head)
+    if encoder_state is not None:
+        model.encoder.load_state_dict(encoder_state)
     info = fit(model, X, y, cfg, np.random.default_rng(seed), X_val, y_val)
     return model, info
 

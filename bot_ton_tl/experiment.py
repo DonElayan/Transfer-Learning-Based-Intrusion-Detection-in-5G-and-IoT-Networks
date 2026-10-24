@@ -12,8 +12,13 @@ group-split ToN-IoT test set:
     target_only   same network trained from scratch on the k-shot budget    (no transfer)
     rf            random forest on the k-shot budget                         (no transfer)
     frozen        pre-trained encoder frozen + new head (the repo's CNN-TL recipe)
-    finetune      pre-trained encoder, LP-FT (head first, then everything)
+    finetune      pre-trained encoder, LP-FT (head first, then everything at a 10x smaller
+                  encoder learning rate - conservative, keeps the encoder close to BoT-IoT)
     dann          DANN-pre-trained encoder, LP-FT
+    finetune_full pre-trained encoder trained exactly like target_only (same learning rate,
+                  steps and early stopping): the ONLY difference from target_only is the
+                  initialisation, so finetune_full - target_only is the clean transfer effect
+    dann_full     same, starting from the DANN-pre-trained encoder
 
 Model selection inside a budget uses 20% of that budget only; the large ToN validation
 split is never used for few-shot runs (it would leak labels beyond the budget).
@@ -38,9 +43,10 @@ from .models import count_params
 from .schema import BOT, SHARED_CLASS_MAP, TON
 from .train import TrainConfig, finetune, predict_proba, scaled, train_dann, train_supervised
 
-ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann")
-NEEDS_SOURCE = {"source_only", "frozen", "finetune"}
-NEEDS_DANN = {"dann_zero", "dann"}
+ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann",
+               "finetune_full", "dann_full")
+NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full"}
+NEEDS_DANN = {"dann_zero", "dann", "dann_full"}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -262,8 +268,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         proba = np.zeros((len(t_te.X), n_out))
                         proba[:, rf.classes_] = rf.predict_proba(t_te.X)
                         info = {}
-                    elif method == "target_only":
-                        model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh)
+                    elif method in ("target_only", "finetune_full", "dann_full"):
+                        donor = {"finetune_full": src_model, "dann_full": dann_model}.get(method)
+                        model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh,
+                                                       encoder_state=None if donor is None else donor.encoder.state_dict())
                         proba = predict_proba(model, t_te.X, args.device)
                     elif method in ("frozen", "finetune", "dann"):
                         donor = dann_model if method == "dann" else src_model
@@ -281,7 +289,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     pd.DataFrame(per_class).to_csv(out / "per_class.csv", index=False)
     summary = summarize(results)
     summary.to_csv(out / "summary.csv", index=False)
-    text = render_summary(summary, args, src, tgt, time.time() - t_start)
+    text = render_summary(summary, args, src, tgt, time.time() - t_start) + render_gains(results)
     (out / "summary.txt").write_text(text, encoding="utf-8")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     config.update(source_classes=src_classes, target_classes=tgt_classes, features=s_tr.names,
@@ -327,6 +335,34 @@ def render_summary(summary: pd.DataFrame, args, src: DomainData, tgt: DomainData
             lines.append(cells.to_string())
             lines.append("")
     lines.append(f"total time {seconds / 60:.1f} min")
+    return "\n".join(lines) + "\n"
+
+
+def render_gains(results: pd.DataFrame) -> str:
+    """Paired comparison per seed: transfer method minus each no-transfer baseline."""
+    order = lambda c: (int(c) if str(c).isdigit() else float("inf"))  # noqa: E731
+    transfer = [m for m in ("finetune_full", "dann_full", "finetune", "dann", "frozen") if m in set(results["method"])]
+    lines = ["TRANSFER GAIN, paired by seed: mean macro-F1 difference (seeds where transfer wins / seeds)",
+             "positive = transfer helps; a gain is convincing only if it wins on every seed", ""]
+    for task in ("binary", "multiclass"):
+        r = results[(results["task"] == task) & (results["shots"].astype(str) != "0")]
+        if r.empty or not transfer:
+            continue
+        r = r.assign(shots=r["shots"].astype(str))
+        piv = r.pivot_table(index=["shots", "seed"], columns="method", values="macro_f1", aggfunc="first")
+        for base in ("target_only", "rf"):
+            if base not in piv:
+                continue
+            table = {}
+            for m in transfer:
+                if m not in piv:
+                    continue
+                d = (piv[m] - piv[base]).dropna()
+                g = d.groupby(level="shots")
+                table[m] = {k: f"{v.mean():+.3f} ({int((v > 0).sum())}/{len(v)})" for k, v in g}
+            frame = pd.DataFrame(table).T
+            frame = frame[sorted(frame.columns, key=order)]
+            lines += [f"[{task}] transfer minus {base}", frame.to_string(), ""]
     return "\n".join(lines) + "\n"
 
 

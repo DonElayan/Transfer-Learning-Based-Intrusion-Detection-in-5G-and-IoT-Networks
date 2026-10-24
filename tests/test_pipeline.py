@@ -45,7 +45,8 @@ def test_experiment_quick(prepared, tmp_path):
     experiment.main(["--prepared", str(prepared), "--out", str(out), "--quick", "--shots", "5",
                      "--unseen-classes", "mitm"])
     res = pd.read_csv(out / "results.csv")
-    expected = {"source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann"}
+    expected = {"source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann", "tl_match",
+                "match_scratch"}
     assert expected <= set(res.loc[res.task == "binary", "method"])
     assert res["macro_f1"].between(0, 1).all()
     per_class = pd.read_csv(out / "per_class.csv")

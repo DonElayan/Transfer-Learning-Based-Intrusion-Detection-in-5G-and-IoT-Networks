@@ -1,5 +1,6 @@
 """Training loops: supervised (source pre-training / target-only), linear-probe-then-
-fine-tune (LP-FT), and domain-adversarial pre-training (DANN, Ganin et al. 2016).
+fine-tune (LP-FT), domain-adversarial pre-training (DANN, Ganin et al. 2016) and the
+proposed transfer + consistency training on unlabelled target flows (train_consistency).
 
 Training is step-based with mini-batches drawn with replacement, so the same loop
 serves 30-sample few-shot budgets and 500k-row pre-training. No torch DataLoader is
@@ -109,6 +110,66 @@ def train_supervised(arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, cf
         model.encoder.load_state_dict(encoder_state)
     info = fit(model, X, y, cfg, np.random.default_rng(seed), X_val, y_val)
     return model, info
+
+
+def train_consistency(encoder_state: dict | None, arch: str, X: np.ndarray, y: np.ndarray, n_classes: int,
+                      X_pool: np.ndarray, cfg: TrainConfig, seed: int, X_val=None, y_val=None,
+                      threshold: float = 0.9, corrupt: float = 0.3, unlabeled_weight: float = 1.0,
+                      unlabeled_ratio: int = 4) -> tuple[Net, dict]:
+    """FixMatch for tabular flows (Sohn et al. 2020; corruption as in SCARF, Bahri et al. 2022).
+
+    Every step: a class-balanced labelled batch (cross-entropy) plus `unlabeled_ratio` x as many
+    unlabelled target flows. The model's prediction on the clean flow becomes a pseudo-label
+    when its confidence is >= `threshold`; the model is then trained to predict that label for
+    a corrupted copy where a `corrupt` share of the features is replaced by the same feature of
+    random other pool flows. Starts from the given (BoT-IoT) encoder when encoder_state is set.
+    """
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    device = cfg.device
+    model = Net(make_encoder(arch, X.shape[1]), n_classes).to(device)
+    if encoder_state is not None:
+        model.encoder.load_state_dict(encoder_state)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    ce = nn.CrossEntropyLoss()
+    sampler = BatchSampler(y, cfg.batch_size, cfg.balanced, rng)
+    Xt, yt = torch.from_numpy(X).to(device), torch.from_numpy(y.astype(np.int64)).to(device)
+    Xp = torch.from_numpy(X_pool).to(device)
+    nu = cfg.batch_size * unlabeled_ratio
+    has_val = X_val is not None and len(X_val) > 0
+    best_score, best_state, bad, step, used = -math.inf, None, 0, 0, 0.0
+    for step in range(1, cfg.steps + 1):
+        model.train()
+        idx = torch.from_numpy(sampler()).to(device)
+        loss = ce(model(Xt[idx]), yt[idx])
+        u = Xp[torch.from_numpy(rng.integers(0, len(X_pool), size=nu)).to(device)]
+        with torch.no_grad():
+            model.eval()
+            probs = torch.softmax(model(u), dim=1)
+            model.train()
+        conf, pseudo = probs.max(1)
+        mask = conf >= threshold
+        if mask.any():
+            donors = Xp[torch.from_numpy(rng.integers(0, len(X_pool), size=nu)).to(device)]
+            swap = torch.rand_like(u) < corrupt
+            strong = torch.where(swap, donors, u)
+            loss = loss + unlabeled_weight * ce(model(strong[mask]), pseudo[mask]) * mask.float().mean()
+            used += float(mask.float().mean())
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if has_val and (step % cfg.eval_every == 0 or step == cfg.steps):
+            score = macro_f1(model, X_val, y_val, device)
+            if score > best_score + 1e-4:
+                best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
+            else:
+                bad += 1
+                if bad >= cfg.patience:
+                    break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {"steps": step, "val_macro_f1": best_score if has_val else float("nan"),
+                   "pseudo_share": round(used / max(step, 1), 3)}
 
 
 def finetune(encoder_state: dict, arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, seed: int,

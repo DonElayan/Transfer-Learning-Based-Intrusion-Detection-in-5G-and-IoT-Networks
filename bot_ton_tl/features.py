@@ -131,3 +131,4 @@ class Standardizer:
 
     def state(self) -> dict:
         return {"mean": self.mean.tolist(), "std": self.std.tolist(), "continuous": self.continuous.tolist()}
+

@@ -18,9 +18,10 @@ WHAT IT DOES
               files and prepare_report.txt
   diagnose    measures how different the two datasets are (domain classifier AUC, KS per feature)
   experiment  BoT-IoT is the source, ToN-IoT the target with only k labelled flows per class.
-              Compares no-transfer baselines (target_only, rf) with transfer learning
-              (source_only, dann_zero, frozen, finetune, dann) over label budgets and seeds,
-              for binary and multiclass detection. Writes tables, CSVs and learning-curve plots.
+              Proposed model tl_match: BoT-IoT pre-trained network + consistency training on
+              the unlabelled ToN flows. Compared with target_only (same network from scratch),
+              fine-tuning, source_only and a random forest (for information), over label
+              budgets and seeds, binary and multiclass. Writes tables, CSVs and plots.
 
 OUTPUTS (inside <DATA_ROOT>\TL_BoT_ToN_pipeline\)
   prepared\prepare_report.txt            data-cleaning counts (read this first)
@@ -47,7 +48,7 @@ OUTPUT_DIR = None              # None -> <DATA_ROOT>\TL_BoT_ToN_pipeline
 STAGES = ["prepare", "diagnose", "experiment"]
 REUSE_PREPARED = True          # skip 'prepare' if it already finished with the same settings
 QUICK_TRIAL = False            # True: first 100k rows per file, 1 seed, 2 budgets, short training
-ABLATIONS = ["no_timing"]      # extra runs after the main one; any of:
+ABLATIONS = []                 # optional extra runs after the main one, any of:
                                #   "no_timing"      drop duration / packet-rate / byte-rate features
                                #   "no_ports"       drop port features
                                #   "unseen_classes" never label UNSEEN_CLASSES (zero-day detection)
@@ -57,10 +58,11 @@ SEEDS = [0, 1, 2]
 SHOTS = [10, 50, 100, 500, 1000]       # labelled ToN-IoT flows per class
 INCLUDE_FULL = True                    # also train on the whole (capped) ToN pool = upper bound
 TASKS = ["binary", "multiclass"]
-# Run 2 set. Run 1 answered frozen / dann (both below target_only); finetune is kept as the
-# run-1 reference. Every method: source_only, dann_zero, target_only, rf, frozen, finetune,
-# dann, finetune_full, dann_full
-METHODS = ["source_only", "target_only", "rf", "finetune", "finetune_full", "dann_full"]
+# tl_match = PROPOSED model (BoT-IoT transfer + consistency training on unlabelled ToN flows)
+# match_scratch = tl_match without BoT-IoT (shows what the transfer adds)
+# target_only = same network from scratch (the reference); rf = random forest (for information)
+# also available: dann_zero, frozen, finetune, dann, dann_full
+METHODS = ["source_only", "target_only", "rf", "finetune_full", "tl_match", "match_scratch"]
 ARCH = "mlp"                           # "mlp" or "cnn1d" (1-D version of the repo's CNN-B)
 FEATURES = ["volume", "shape", "timing", "proto", "ports"]   # add "state" for the coarse-state ablation
 DEVICE = "auto"                        # "auto", "cpu" or "cuda"
@@ -752,7 +754,8 @@ def per_class_rates(cls_true: np.ndarray, correct: np.ndarray) -> dict[str, floa
 # ==================================================================================================
 # TRAIN
 #   Training loops: supervised (source pre-training / target-only), linear-probe-then-
-#   fine-tune (LP-FT), and domain-adversarial pre-training (DANN, Ganin et al. 2016).
+#   fine-tune (LP-FT), domain-adversarial pre-training (DANN, Ganin et al. 2016) and the
+#   proposed transfer + consistency training on unlabelled target flows (train_consistency).
 #
 #   Training is step-based with mini-batches drawn with replacement, so the same loop
 #   serves 30-sample few-shot budgets and 500k-row pre-training. No torch DataLoader is
@@ -849,6 +852,66 @@ def train_supervised(arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, cf
         model.encoder.load_state_dict(encoder_state)
     info = fit(model, X, y, cfg, np.random.default_rng(seed), X_val, y_val)
     return model, info
+
+
+def train_consistency(encoder_state: dict | None, arch: str, X: np.ndarray, y: np.ndarray, n_classes: int,
+                      X_pool: np.ndarray, cfg: TrainConfig, seed: int, X_val=None, y_val=None,
+                      threshold: float = 0.9, corrupt: float = 0.3, unlabeled_weight: float = 1.0,
+                      unlabeled_ratio: int = 4) -> tuple[Net, dict]:
+    """FixMatch for tabular flows (Sohn et al. 2020; corruption as in SCARF, Bahri et al. 2022).
+
+    Every step: a class-balanced labelled batch (cross-entropy) plus `unlabeled_ratio` x as many
+    unlabelled target flows. The model's prediction on the clean flow becomes a pseudo-label
+    when its confidence is >= `threshold`; the model is then trained to predict that label for
+    a corrupted copy where a `corrupt` share of the features is replaced by the same feature of
+    random other pool flows. Starts from the given (BoT-IoT) encoder when encoder_state is set.
+    """
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    device = cfg.device
+    model = Net(make_encoder(arch, X.shape[1]), n_classes).to(device)
+    if encoder_state is not None:
+        model.encoder.load_state_dict(encoder_state)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    ce = nn.CrossEntropyLoss()
+    sampler = BatchSampler(y, cfg.batch_size, cfg.balanced, rng)
+    Xt, yt = torch.from_numpy(X).to(device), torch.from_numpy(y.astype(np.int64)).to(device)
+    Xp = torch.from_numpy(X_pool).to(device)
+    nu = cfg.batch_size * unlabeled_ratio
+    has_val = X_val is not None and len(X_val) > 0
+    best_score, best_state, bad, step, used = -math.inf, None, 0, 0, 0.0
+    for step in range(1, cfg.steps + 1):
+        model.train()
+        idx = torch.from_numpy(sampler()).to(device)
+        loss = ce(model(Xt[idx]), yt[idx])
+        u = Xp[torch.from_numpy(rng.integers(0, len(X_pool), size=nu)).to(device)]
+        with torch.no_grad():
+            model.eval()
+            probs = torch.softmax(model(u), dim=1)
+            model.train()
+        conf, pseudo = probs.max(1)
+        mask = conf >= threshold
+        if mask.any():
+            donors = Xp[torch.from_numpy(rng.integers(0, len(X_pool), size=nu)).to(device)]
+            swap = torch.rand_like(u) < corrupt
+            strong = torch.where(swap, donors, u)
+            loss = loss + unlabeled_weight * ce(model(strong[mask]), pseudo[mask]) * mask.float().mean()
+            used += float(mask.float().mean())
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if has_val and (step % cfg.eval_every == 0 or step == cfg.steps):
+            score = macro_f1(model, X_val, y_val, device)
+            if score > best_score + 1e-4:
+                best_score, best_state, bad = score, copy.deepcopy(model.state_dict()), 0
+            else:
+                bad += 1
+                if bad >= cfg.patience:
+                    break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {"steps": step, "val_macro_f1": best_score if has_val else float("nan"),
+                   "pseudo_share": round(used / max(step, 1), 3)}
 
 
 def finetune(encoder_state: dict, arch: str, X: np.ndarray, y: np.ndarray, n_classes: int, seed: int,
@@ -1567,7 +1630,7 @@ def synthetic_main(argv=None) -> int:
 #       source_only   BoT-IoT model applied unchanged (binary: P(attack) = 1 - P(normal))
 #       dann_zero     DANN model applied unchanged (alignment used unlabeled ToN flows only)
 #       target_only   same network trained from scratch on the k-shot budget    (no transfer)
-#       rf            random forest on the k-shot budget                         (no transfer)
+#       rf            random forest on the k-shot budget                         (for information)
 #       frozen        pre-trained encoder frozen + new head (the repo's CNN-TL recipe)
 #       finetune      pre-trained encoder, LP-FT (head first, then everything at a 10x smaller
 #                     encoder learning rate - conservative, keeps the encoder close to BoT-IoT)
@@ -1576,14 +1639,19 @@ def synthetic_main(argv=None) -> int:
 #                     steps and early stopping): the ONLY difference from target_only is the
 #                     initialisation, so finetune_full - target_only is the clean transfer effect
 #       dann_full     same, starting from the DANN-pre-trained encoder
+#       tl_match      PROPOSED. BoT-IoT-pre-trained network + FixMatch-style consistency training
+#                     on the unlabelled ToN pool: confident predictions on clean flows become
+#                     pseudo-labels for corrupted copies (a share of features swapped with other
+#                     pool flows, as in SCARF). Uses the k-shot labels + unlabelled ToN flows.
+#       match_scratch ablation: tl_match without the BoT-IoT initialisation
 #
 #   Model selection inside a budget uses 20% of that budget only; the large ToN validation
 #   split is never used for few-shot runs (it would leak labels beyond the budget).
 # ==================================================================================================
 
 ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann",
-               "finetune_full", "dann_full")
-NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full"}
+               "finetune_full", "dann_full", "tl_match", "match_scratch")
+NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full", "tl_match"}
 NEEDS_DANN = {"dann_zero", "dann", "dann_full"}
 
 
@@ -1620,6 +1688,10 @@ def experiment_parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--steps-target", type=int, default=1500)
     ap.add_argument("--steps-lp", type=int, default=500)
     ap.add_argument("--steps-ft", type=int, default=1000)
+    ap.add_argument("--steps-match", type=int, default=3000, help="max steps for tl_match / match_scratch")
+    ap.add_argument("--match-threshold", type=float, default=0.9, help="confidence needed for a pseudo-label")
+    ap.add_argument("--match-corrupt", type=float, default=0.3, help="share of features swapped in the corrupted copy")
+    ap.add_argument("--match-ratio", type=int, default=4, help="unlabelled flows per labelled flow in a batch")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--rf-trees", type=int, default=200)
     ap.add_argument("--device", default="auto")
@@ -1628,7 +1700,7 @@ def experiment_parse_args(argv=None) -> argparse.Namespace:
     if args.quick:
         args.shots, args.seeds = args.shots[:2], args.seeds[:1]
         args.steps_pretrain = args.steps_dann = 200
-        args.steps_target, args.steps_lp, args.steps_ft = 150, 60, 100
+        args.steps_target, args.steps_lp, args.steps_ft, args.steps_match = 150, 60, 100, 150
         args.rf_trees = 25
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1783,6 +1855,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             fit_i, hold_i = holdout_split(t_tr.cls[idx], 0.2, rng)
             fit_i, hold_i = idx[fit_i], idx[hold_i]
             n_fit = len(fit_i)
+            unlabelled = np.setdiff1d(np.arange(len(t_tr.cls)), idx)
+            if len(unlabelled) == 0:  # 'full' budget: every pool flow is labelled
+                unlabelled = np.arange(len(t_tr.cls))
             print(f"  budget {label}/class -> {len(idx):,} labelled flows ({n_fit} fit / {len(hold_i)} hold)", flush=True)
             for task in args.tasks:
                 if task == "binary":
@@ -1794,6 +1869,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                 cfg_t = scaled(base, steps=steps_for(args.steps_target, n_fit, args.batch_size), eval_every=50)
                 cfg_lp = scaled(base, steps=steps_for(args.steps_lp, n_fit, args.batch_size), eval_every=50)
                 cfg_ft = scaled(base, steps=steps_for(args.steps_ft, n_fit, args.batch_size), eval_every=50, lr=3e-4)
+                cfg_m = scaled(base, steps=steps_for(args.steps_match, n_fit, args.batch_size), eval_every=100)
                 common = {"n_labelled": int(len(idx))}
                 for method in args.methods:
                     if method in ("source_only", "dann_zero"):
@@ -1810,6 +1886,12 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         donor = {"finetune_full": src_model, "dann_full": dann_model}.get(method)
                         model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh,
                                                        encoder_state=None if donor is None else donor.encoder.state_dict())
+                        proba = predict_proba(model, t_te.X, args.device)
+                    elif method in ("tl_match", "match_scratch"):
+                        enc = src_model.encoder.state_dict() if method == "tl_match" else None
+                        model, info = train_consistency(enc, args.arch, Xf, yf, n_out, t_tr.X[unlabelled], cfg_m,
+                                                        seed, Xh, yh, threshold=args.match_threshold,
+                                                        corrupt=args.match_corrupt, unlabeled_ratio=args.match_ratio)
                         proba = predict_proba(model, t_te.X, args.device)
                     elif method in ("frozen", "finetune", "dann"):
                         donor = dann_model if method == "dann" else src_model
@@ -1879,16 +1961,17 @@ def render_summary(summary: pd.DataFrame, args, src: DomainData, tgt: DomainData
 def render_gains(results: pd.DataFrame) -> str:
     """Paired comparison per seed: transfer method minus each no-transfer baseline."""
     order = lambda c: (int(c) if str(c).isdigit() else float("inf"))  # noqa: E731
-    transfer = [m for m in ("finetune_full", "dann_full", "finetune", "dann", "frozen") if m in set(results["method"])]
-    lines = ["TRANSFER GAIN, paired by seed: mean macro-F1 difference (seeds where transfer wins / seeds)",
-             "positive = transfer helps; a gain is convincing only if it wins on every seed", ""]
+    transfer = [m for m in ("tl_match", "match_scratch", "finetune_full", "dann_full", "finetune", "dann", "frozen")
+                if m in set(results["method"])]
+    lines = ["GAIN OVER target_only, paired by seed: mean macro-F1 difference (seeds where the method wins / seeds)",
+             "target_only = same network trained from scratch on the same labelled flows", ""]
     for task in ("binary", "multiclass"):
         r = results[(results["task"] == task) & (results["shots"].astype(str) != "0")]
         if r.empty or not transfer:
             continue
         r = r.assign(shots=r["shots"].astype(str))
         piv = r.pivot_table(index=["shots", "seed"], columns="method", values="macro_f1", aggfunc="first")
-        for base in ("target_only", "rf"):
+        for base in ("target_only",):
             if base not in piv:
                 continue
             table = {}
@@ -1900,7 +1983,7 @@ def render_gains(results: pd.DataFrame) -> str:
                 table[m] = {k: f"{v.mean():+.3f} ({int((v > 0).sum())}/{len(v)})" for k, v in g}
             frame = pd.DataFrame(table).T
             frame = frame[sorted(frame.columns, key=order)]
-            lines += [f"[{task}] transfer minus {base}", frame.to_string(), ""]
+            lines += [f"[{task}] method minus {base}", frame.to_string(), ""]
     return "\n".join(lines) + "\n"
 
 

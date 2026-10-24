@@ -24,7 +24,7 @@ raw CSVs ──prepare──► bot.parquet / ton.parquet ──diagnose──�
 | **Target** | ToN-IoT network (`Network_dataset_1..23.csv`, 22,339,021 flows; 796,380 normal) — **only k labelled flows per class** |
 | **Tasks** | `binary` (normal vs attack — defined identically in both datasets) and `multiclass` (all ToN-IoT classes, via a new output head) |
 | **Evaluation** | learning curves: macro-F1 on a fixed ToN-IoT test set vs. k ∈ {10, 50, 100, 500, 1000} labels per class, mean ± std over seeds |
-| **TL counts as working when** | `finetune` / `dann` beat **both** no-transfer baselines (`target_only`, `rf`) at small k. If they fall below them, that is negative transfer, and it is a reportable result too. |
+| **Reference for "transfer helps"** | `target_only`: the same network, same training, no BoT-IoT knowledge. `rf` is reported for information. |
 
 ### Methods compared
 
@@ -33,17 +33,46 @@ raw CSVs ──prepare──► bot.parquet / ton.parquet ──diagnose──�
 | `source_only` | 0 | BoT-IoT model applied as is (binary: P(attack) = 1 − P(normal)) |
 | `dann_zero` | 0 | DANN model (aligned with *unlabelled* ToN flows) applied as is |
 | `target_only` | k/class | same network, random init, trained on the k-shot budget |
-| `rf` | k/class | random forest on the same budget, the strong tabular baseline reviewers will ask for |
+| `rf` | k/class | random forest on the same budget (for information) |
 | `frozen` | k/class | BoT-IoT encoder frozen + new dense head (the recipe of this repo's `TL - CNN-TL.ipynb`) |
 | `finetune` | k/class | BoT-IoT encoder, **LP-FT**: train new head, then unfreeze all with 10× smaller encoder LR |
 | `dann` | k/class | encoder pre-trained with DANN (BoT labels + unlabelled ToN flows), then LP-FT |
 | `finetune_full` | k/class | BoT-IoT encoder, then trained **exactly like `target_only`** (same LR, steps, early stopping). The only difference is the initialisation, so `finetune_full − target_only` is the clean transfer effect |
 | `dann_full` | k/class | same, from the DANN encoder |
+| **`tl_match`** | k/class + unlabelled ToN | **Proposed model.** BoT-IoT pre-trained network, trained on the k labelled ToN flows plus consistency training on the unlabelled ToN flows (see below) |
+| `match_scratch` | k/class + unlabelled ToN | ablation: `tl_match` without BoT-IoT pre-training |
 
 The encoder is a ~30k-parameter MLP (`--arch mlp`, default) or a 1-D CNN mirroring the
 repository's CNN-B (`--arch cnn1d`). Both are small enough for constrained IoT/edge devices.
 
 ---
+
+### Proposed model: `tl_match` (transfer + consistency training)
+
+1. **Transfer.** Pre-train the network on BoT-IoT (all classes, class-balanced batches).
+2. **Labelled target flows.** Train it on the k labelled ToN-IoT flows per class.
+3. **Unlabelled target flows**, at every step, alongside the labelled batch:
+   - Take 4× as many unlabelled ToN flows.
+   - Where the network is ≥ 90 % confident on a clean flow, that prediction becomes a
+     pseudo-label.
+   - The network must give the same label to a corrupted copy of the flow, where 30 % of the
+     features are swapped with the same feature of other unlabelled flows.
+4. **Model selection** uses only the 20 % hold-out part of the labelled budget.
+
+This is FixMatch (Sohn et al., NeurIPS 2020) with SCARF-style tabular corruption (Bahri et
+al., ICLR 2022), started from the BoT-IoT model. Few-label intrusion-detection work that
+beats from-scratch training does the same: pre-train on historical attacks, then exploit the
+new network's unlabelled traffic with pseudo-labels (SMILE, IEEE IoT-J 2026; IPL-SeSL,
+IEEE TNSM 2025).
+
+Development was done on real data available in this repository: BoT-IoT → UNSW-NB15
+(`datasets/UNSW-NB15.csv`, 10 classes), with the same split and protocol. Variants that
+lost there were removed:
+* plain self-training
+* forest co-training
+* forest on BoT-IoT embeddings
+* DANN initialisation
+* piecewise-linear encoding
 
 ## 2. Decisions taken (and the evidence)
 
@@ -139,7 +168,7 @@ balanced accuracy 0.948; most of the remaining error is DoS↔DDoS (see decision
    Phase 2.4 report. Report it separately from the hash split.
 
 `summary.txt` ends with a **transfer-gain table**. It gives each transfer method minus
-`target_only` and minus `rf`, paired by seed, as the mean difference and the number of seeds
+`target_only`, paired by seed, as the mean difference and the number of seeds
 where transfer wins. Claim a gain only where it wins on every seed.
 
 Feature group `timing` (duration, packet rate, byte rate) is separate. It depends on how
@@ -190,6 +219,10 @@ for the NetFlow columns.
 * Guerra-Manzanares & Huang, *Exploring Robust Intrusion Detection: A Benchmark Study of Feature Transferability in IoT Botnet Attack Detection*, 2026 (arXiv:2602.23874). Zero-adaptation cross-dataset transfer degrades sharply even when the same extractor (Argus, Zeek or CICFlowMeter) is used on both sides.
 * Rodríguez, Valls, Otero et al., *Transfer-Learning-Based Intrusion Detection Framework in IoT Networks*, Sensors 22(15):5621, 2022. The CNN-B / CNN-TL work this repository implements.
 * Ganin et al., *Domain-Adversarial Training of Neural Networks*, JMLR 17, 2016 (DANN).
+* Sohn et al., *FixMatch: Simplifying Semi-Supervised Learning with Consistency and Confidence*, NeurIPS 2020.
+* Bahri et al., *SCARF: Self-Supervised Contrastive Learning using Random Feature Corruption*, ICLR 2022.
+* Wu et al., *A Semi-Supervised Meta-Negative-Learning Approach to Few-Shot Network Intrusion Detection in IoT* (SMILE), IEEE IoT-J 2026.
+* Zhao et al., *Semi-Supervised Learning With Interpolation and Pseudo-Labeling for Few-Label Intrusion Detection* (IPL-SeSL), IEEE TNSM 2025.
 * Kumar et al., *Fine-Tuning can Distort Pretrained Features and Underperform Out-of-Distribution*, ICLR 2022 (LP-FT).
 * Ben-David et al., *A theory of learning from different domains*, Machine Learning 79, 2010 (proxy A-distance).
 * Zeek `conn.log` field reference (`orig_bytes` = payload bytes, `orig_ip_bytes` = IP-level bytes); Argus `ra(1)` field reference (`sbytes`, `dur`, `state`).

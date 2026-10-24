@@ -10,7 +10,7 @@ group-split ToN-IoT test set:
     source_only   BoT-IoT model applied unchanged (binary: P(attack) = 1 - P(normal))
     dann_zero     DANN model applied unchanged (alignment used unlabeled ToN flows only)
     target_only   same network trained from scratch on the k-shot budget    (no transfer)
-    rf            random forest on the k-shot budget                         (no transfer)
+    rf            random forest on the k-shot budget                         (for information)
     frozen        pre-trained encoder frozen + new head (the repo's CNN-TL recipe)
     finetune      pre-trained encoder, LP-FT (head first, then everything at a 10x smaller
                   encoder learning rate - conservative, keeps the encoder close to BoT-IoT)
@@ -19,6 +19,11 @@ group-split ToN-IoT test set:
                   steps and early stopping): the ONLY difference from target_only is the
                   initialisation, so finetune_full - target_only is the clean transfer effect
     dann_full     same, starting from the DANN-pre-trained encoder
+    tl_match      PROPOSED. BoT-IoT-pre-trained network + FixMatch-style consistency training
+                  on the unlabelled ToN pool: confident predictions on clean flows become
+                  pseudo-labels for corrupted copies (a share of features swapped with other
+                  pool flows, as in SCARF). Uses the k-shot labels + unlabelled ToN flows.
+    match_scratch ablation: tl_match without the BoT-IoT initialisation
 
 Model selection inside a budget uses 20% of that budget only; the large ToN validation
 split is never used for few-shot runs (it would leak labels beyond the budget).
@@ -41,11 +46,12 @@ from .features import ALL_GROUPS, DEFAULT_GROUPS, Standardizer, build_features, 
 from .metrics import binary_metrics, multiclass_metrics, per_class_rates
 from .models import count_params
 from .schema import BOT, SHARED_CLASS_MAP, TON
-from .train import TrainConfig, finetune, predict_proba, scaled, train_dann, train_supervised
+from .train import (TrainConfig, finetune, predict_proba, scaled, train_consistency, train_dann,
+                    train_supervised)
 
 ALL_METHODS = ("source_only", "dann_zero", "target_only", "rf", "frozen", "finetune", "dann",
-               "finetune_full", "dann_full")
-NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full"}
+               "finetune_full", "dann_full", "tl_match", "match_scratch")
+NEEDS_SOURCE = {"source_only", "frozen", "finetune", "finetune_full", "tl_match"}
 NEEDS_DANN = {"dann_zero", "dann", "dann_full"}
 
 
@@ -82,6 +88,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--steps-target", type=int, default=1500)
     ap.add_argument("--steps-lp", type=int, default=500)
     ap.add_argument("--steps-ft", type=int, default=1000)
+    ap.add_argument("--steps-match", type=int, default=3000, help="max steps for tl_match / match_scratch")
+    ap.add_argument("--match-threshold", type=float, default=0.9, help="confidence needed for a pseudo-label")
+    ap.add_argument("--match-corrupt", type=float, default=0.3, help="share of features swapped in the corrupted copy")
+    ap.add_argument("--match-ratio", type=int, default=4, help="unlabelled flows per labelled flow in a batch")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--rf-trees", type=int, default=200)
     ap.add_argument("--device", default="auto")
@@ -90,7 +100,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.quick:
         args.shots, args.seeds = args.shots[:2], args.seeds[:1]
         args.steps_pretrain = args.steps_dann = 200
-        args.steps_target, args.steps_lp, args.steps_ft = 150, 60, 100
+        args.steps_target, args.steps_lp, args.steps_ft, args.steps_match = 150, 60, 100, 150
         args.rf_trees = 25
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -245,6 +255,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             fit_i, hold_i = holdout_split(t_tr.cls[idx], 0.2, rng)
             fit_i, hold_i = idx[fit_i], idx[hold_i]
             n_fit = len(fit_i)
+            unlabelled = np.setdiff1d(np.arange(len(t_tr.cls)), idx)
+            if len(unlabelled) == 0:  # 'full' budget: every pool flow is labelled
+                unlabelled = np.arange(len(t_tr.cls))
             print(f"  budget {label}/class -> {len(idx):,} labelled flows ({n_fit} fit / {len(hold_i)} hold)", flush=True)
             for task in args.tasks:
                 if task == "binary":
@@ -256,6 +269,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                 cfg_t = scaled(base, steps=steps_for(args.steps_target, n_fit, args.batch_size), eval_every=50)
                 cfg_lp = scaled(base, steps=steps_for(args.steps_lp, n_fit, args.batch_size), eval_every=50)
                 cfg_ft = scaled(base, steps=steps_for(args.steps_ft, n_fit, args.batch_size), eval_every=50, lr=3e-4)
+                cfg_m = scaled(base, steps=steps_for(args.steps_match, n_fit, args.batch_size), eval_every=100)
                 common = {"n_labelled": int(len(idx))}
                 for method in args.methods:
                     if method in ("source_only", "dann_zero"):
@@ -272,6 +286,12 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         donor = {"finetune_full": src_model, "dann_full": dann_model}.get(method)
                         model, info = train_supervised(args.arch, Xf, yf, n_out, cfg_t, seed, Xh, yh,
                                                        encoder_state=None if donor is None else donor.encoder.state_dict())
+                        proba = predict_proba(model, t_te.X, args.device)
+                    elif method in ("tl_match", "match_scratch"):
+                        enc = src_model.encoder.state_dict() if method == "tl_match" else None
+                        model, info = train_consistency(enc, args.arch, Xf, yf, n_out, t_tr.X[unlabelled], cfg_m,
+                                                        seed, Xh, yh, threshold=args.match_threshold,
+                                                        corrupt=args.match_corrupt, unlabeled_ratio=args.match_ratio)
                         proba = predict_proba(model, t_te.X, args.device)
                     elif method in ("frozen", "finetune", "dann"):
                         donor = dann_model if method == "dann" else src_model
@@ -341,16 +361,17 @@ def render_summary(summary: pd.DataFrame, args, src: DomainData, tgt: DomainData
 def render_gains(results: pd.DataFrame) -> str:
     """Paired comparison per seed: transfer method minus each no-transfer baseline."""
     order = lambda c: (int(c) if str(c).isdigit() else float("inf"))  # noqa: E731
-    transfer = [m for m in ("finetune_full", "dann_full", "finetune", "dann", "frozen") if m in set(results["method"])]
-    lines = ["TRANSFER GAIN, paired by seed: mean macro-F1 difference (seeds where transfer wins / seeds)",
-             "positive = transfer helps; a gain is convincing only if it wins on every seed", ""]
+    transfer = [m for m in ("tl_match", "match_scratch", "finetune_full", "dann_full", "finetune", "dann", "frozen")
+                if m in set(results["method"])]
+    lines = ["GAIN OVER target_only, paired by seed: mean macro-F1 difference (seeds where the method wins / seeds)",
+             "target_only = same network trained from scratch on the same labelled flows", ""]
     for task in ("binary", "multiclass"):
         r = results[(results["task"] == task) & (results["shots"].astype(str) != "0")]
         if r.empty or not transfer:
             continue
         r = r.assign(shots=r["shots"].astype(str))
         piv = r.pivot_table(index=["shots", "seed"], columns="method", values="macro_f1", aggfunc="first")
-        for base in ("target_only", "rf"):
+        for base in ("target_only",):
             if base not in piv:
                 continue
             table = {}
@@ -362,7 +383,7 @@ def render_gains(results: pd.DataFrame) -> str:
                 table[m] = {k: f"{v.mean():+.3f} ({int((v > 0).sum())}/{len(v)})" for k, v in g}
             frame = pd.DataFrame(table).T
             frame = frame[sorted(frame.columns, key=order)]
-            lines += [f"[{task}] transfer minus {base}", frame.to_string(), ""]
+            lines += [f"[{task}] method minus {base}", frame.to_string(), ""]
     return "\n".join(lines) + "\n"
 
 

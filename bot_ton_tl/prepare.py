@@ -34,7 +34,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .parsing import parse_binary_label, parse_numeric, parse_port
-from .schema import (BOT, CANONICAL_NUMERIC, DOMAINS, TON, VECTOR_COLUMNS, DatasetSpec,
+from .schema import (BOT, CANONICAL_NUMERIC, DOMAINS, VECTOR_COLUMNS, DatasetSpec,
                      canonical_class, canonical_proto, get_spec, normalize_col)
 
 CORE_NUMERIC = ["duration", "src_bytes", "dst_bytes", "src_pkts", "dst_pkts"]
